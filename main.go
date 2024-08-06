@@ -13,6 +13,14 @@ import (
 	"github.com/gorilla/mux"
 )
 
+var logger TransactionLogger
+var store = struct {
+	sync.RWMutex
+	m map[string]string
+}{m: make(map[string]string)}
+
+var ErrorNoSuchKey = errors.New("No Such Key")
+
 type TransactionLogger interface {
 	WriteDelete(key string)
 	WritePut(key, value string)
@@ -61,11 +69,13 @@ func (l *FileTransactionLogger) Run() {
 
 	go func() {
 		for e := range events {
+			fmt.Println("Event sent to logger", e)
 			l.lastSequence++
 			_, err := fmt.Fprintf(
 				l.file,
 				"%d\t%d\t%s\t%s\n",
 				l.lastSequence, e.EventType, e.Key, e.Value)
+			fmt.Println(err)
 			if err != nil {
 				errors <- err
 				return
@@ -111,16 +121,36 @@ func NewFileTransactionLogger(filename string) (TransactionLogger, error) {
 	return &FileTransactionLogger{file: file}, nil
 }
 
-var store = struct {
-	sync.RWMutex
-	m map[string]string
-}{m: make(map[string]string)}
+func initalizeTransactionLog() error {
+	var err error
+	logger, err = NewFileTransactionLogger("transaction.log")
+	events, errors := logger.ReadEvents()
+	e, ok := Event{}, true
 
-var ErrorNoSuchKey = errors.New("No Such Key")
+	for ok && err == nil {
+		select {
+		case err, ok = <-errors:
+		case e, ok = <-events:
+			switch e.EventType {
+			case EventDelete:
+				err = Delete(e.Key)
+			case EventPut:
+				err = Put(e.Key, e.Value)
+			}
+		}
+	}
+	logger.Run()
+
+	return err
+
+}
 
 func Put(key, value string) error {
 	store.Lock()
 	store.m[key] = value
+	fmt.Println("reached put")
+	fmt.Println(logger)
+	logger.WritePut(key, value)
 	store.Unlock()
 	return nil
 }
@@ -135,6 +165,7 @@ func Get(key string) (string, error) {
 }
 func Delete(key string) error {
 	store.Lock()
+	logger.WriteDelete(key)
 	delete(store.m, key)
 	store.Unlock()
 	return nil
@@ -186,6 +217,7 @@ func keyValueDeleteHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	initalizeTransactionLog()
 	r := mux.NewRouter()
 	r.HandleFunc("/v1/{key}", keyValuePutHandler).
 		Methods("PUT")

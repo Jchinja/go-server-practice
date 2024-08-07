@@ -51,10 +51,16 @@ type FileTransactionLogger struct {
 }
 
 func (l *FileTransactionLogger) WritePut(key, value string) {
-	l.events <- Event{EventType: EventPut, Key: key, Value: value}
+	select {
+	case l.events <- Event{EventType: EventPut, Key: key, Value: value}:
+	default:
+	}
 }
 func (l *FileTransactionLogger) WriteDelete(key string) {
-	l.events <- Event{EventType: EventDelete, Key: key}
+	select {
+	case l.events <- Event{EventType: EventDelete, Key: key, Value: "delete"}:
+	default:
+	}
 }
 func (l *FileTransactionLogger) Err() <-chan error {
 	return l.errors
@@ -66,10 +72,8 @@ func (l *FileTransactionLogger) Run() {
 	errors := make(chan error, 1)
 
 	l.errors = errors
-
 	go func() {
 		for e := range events {
-			fmt.Println("Event sent to logger", e)
 			l.lastSequence++
 			_, err := fmt.Fprintf(
 				l.file,
@@ -91,11 +95,11 @@ func (l *FileTransactionLogger) ReadEvents() (<-chan Event, <-chan error) {
 		var e Event
 		defer close(outError)
 		defer close(outEvent)
-
 		for scanner.Scan() {
 			line := scanner.Text()
-			if _, err := fmt.Sscanf(line, "%d\t%d\t%s\t%s\n", &e.Sequence, &e.EventType, &e.Key, &e.Value); err != nil {
-				outError <- fmt.Errorf("input parse error:%w", err)
+			_, err := fmt.Sscanf(line, "%d\t%d\t%s\t%s", &e.Sequence, &e.EventType, &e.Key, &e.Value)
+			if err != nil {
+				outError <- fmt.Errorf("input parse error: %w", err)
 				return
 			}
 			if l.lastSequence >= e.Sequence {
@@ -103,7 +107,7 @@ func (l *FileTransactionLogger) ReadEvents() (<-chan Event, <-chan error) {
 				return
 			}
 			l.lastSequence = e.Sequence
-			outEvent <- e // will block until it is read
+			outEvent <- e
 		}
 		if err := scanner.Err(); err != nil {
 			outError <- fmt.Errorf("transaction log read failure: %w", err)
@@ -126,31 +130,29 @@ func initalizeTransactionLog() error {
 	logger, err = NewFileTransactionLogger("transaction.log")
 	events, errors := logger.ReadEvents()
 	e, ok := Event{}, true
-
+	logger.Run()
 	for ok && err == nil {
 		select {
 		case err, ok = <-errors:
+			fmt.Println(err, ok)
 		case e, ok = <-events:
 			switch e.EventType {
 			case EventDelete:
+				fmt.Println("Reading in delete")
 				err = Delete(e.Key)
 			case EventPut:
+				fmt.Println("Reading in put")
 				err = Put(e.Key, e.Value)
 			}
 		}
 	}
-	logger.Run()
-
+	fmt.Println("finished loading data", store.m)
 	return err
-
 }
 
 func Put(key, value string) error {
 	store.Lock()
 	store.m[key] = value
-	fmt.Println("reached put")
-	fmt.Println(logger)
-	logger.WritePut(key, value)
 	store.Unlock()
 	return nil
 }
@@ -165,7 +167,6 @@ func Get(key string) (string, error) {
 }
 func Delete(key string) error {
 	store.Lock()
-	logger.WriteDelete(key)
 	delete(store.m, key)
 	store.Unlock()
 	return nil
@@ -175,18 +176,18 @@ func keyValuePutHandler(w http.ResponseWriter, r *http.Request) {
 
 	key := vars["key"]
 
-	val, err := io.ReadAll(r.Body)
+	value, err := io.ReadAll(r.Body)
 
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	err = Put(key, string(val))
-
+	err = Put(key, string(value))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	logger.WritePut(key, string(value))
 	w.WriteHeader(http.StatusCreated)
 }
 func keyValueGetHandler(w http.ResponseWriter, r *http.Request) {
@@ -207,13 +208,12 @@ func keyValueGetHandler(w http.ResponseWriter, r *http.Request) {
 func keyValueDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	key := vars["key"]
-
 	err := Delete(key)
-
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	logger.WriteDelete(key)
 }
 
 func main() {

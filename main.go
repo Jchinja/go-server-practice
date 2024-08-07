@@ -1,16 +1,16 @@
 package main
 
 import (
-	"bufio"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"sync"
 
 	"github.com/gorilla/mux"
+	_ "github.com/lib/pq"
 )
 
 var logger TransactionLogger
@@ -43,91 +43,122 @@ type Event struct {
 	Key       string
 	Value     string
 }
-type FileTransactionLogger struct {
-	events       chan<- Event
-	errors       <-chan error
-	lastSequence uint64
-	file         *os.File
+
+type PostgresDBParams struct {
+	dbName   string
+	host     string
+	user     string
+	password string
 }
 
-func (l *FileTransactionLogger) WritePut(key, value string) {
+type PostgresTransactionLogger struct {
+	events chan<- Event
+	errors <-chan error
+	db     *sql.DB
+}
+
+func (l *PostgresTransactionLogger) WritePut(key, value string) {
 	select {
 	case l.events <- Event{EventType: EventPut, Key: key, Value: value}:
 	default:
 	}
 }
-func (l *FileTransactionLogger) WriteDelete(key string) {
+func (l *PostgresTransactionLogger) WriteDelete(key string) {
 	select {
 	case l.events <- Event{EventType: EventDelete, Key: key, Value: "delete"}:
 	default:
 	}
 }
-func (l *FileTransactionLogger) Err() <-chan error {
+func (l *PostgresTransactionLogger) Err() <-chan error {
 	return l.errors
 }
-func (l *FileTransactionLogger) Run() {
-	events := make(chan Event, 16)
-	l.events = events
 
-	errors := make(chan error, 1)
+// func (l *PostgresTransactionLogger) Run() {
+// 	events := make(chan Event, 16)
+// 	l.events = events
 
-	l.errors = errors
-	go func() {
-		for e := range events {
-			l.lastSequence++
-			_, err := fmt.Fprintf(
-				l.file,
-				"%d\t%d\t%s\t%s\n",
-				l.lastSequence, e.EventType, e.Key, e.Value)
-			fmt.Println(err)
-			if err != nil {
-				errors <- err
-				return
-			}
-		}
-	}()
-}
-func (l *FileTransactionLogger) ReadEvents() (<-chan Event, <-chan error) {
-	scanner := bufio.NewScanner(l.file)
-	outEvent := make(chan Event)
-	outError := make(chan error, 1)
-	go func() {
-		var e Event
-		defer close(outError)
-		defer close(outEvent)
-		for scanner.Scan() {
-			line := scanner.Text()
-			_, err := fmt.Sscanf(line, "%d\t%d\t%s\t%s", &e.Sequence, &e.EventType, &e.Key, &e.Value)
-			if err != nil {
-				outError <- fmt.Errorf("input parse error: %w", err)
-				return
-			}
-			if l.lastSequence >= e.Sequence {
-				outError <- fmt.Errorf("transaction numbers out of sequence")
-				return
-			}
-			l.lastSequence = e.Sequence
-			outEvent <- e
-		}
-		if err := scanner.Err(); err != nil {
-			outError <- fmt.Errorf("transaction log read failure: %w", err)
-			return
-		}
-	}()
-	return outEvent, outError
-}
+// 	errors := make(chan error, 1)
 
-func NewFileTransactionLogger(filename string) (TransactionLogger, error) {
-	file, err := os.OpenFile(filename, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0755)
+// 	l.errors = errors
+// 	go func() {
+// 		for e := range events {
+// 			l.lastSequence++
+// 			_, err := fmt.Fprintf(
+// 				l.file,
+// 				"%d\t%d\t%s\t%s\n",
+// 				l.lastSequence, e.EventType, e.Key, e.Value)
+// 			fmt.Println(err)
+// 			if err != nil {
+// 				errors <- err
+// 				return
+// 			}
+// 		}
+// 	}()
+// }
+// func (l *FileTransactionLogger) ReadEvents() (<-chan Event, <-chan error) {
+// 	scanner := bufio.NewScanner(l.file)
+// 	outEvent := make(chan Event)
+// 	outError := make(chan error, 1)
+// 	go func() {
+// 		var e Event
+// 		defer close(outError)
+// 		defer close(outEvent)
+// 		for scanner.Scan() {
+// 			line := scanner.Text()
+// 			_, err := fmt.Sscanf(line, "%d\t%d\t%s\t%s", &e.Sequence, &e.EventType, &e.Key, &e.Value)
+// 			if err != nil {
+// 				outError <- fmt.Errorf("input parse error: %w", err)
+// 				return
+// 			}
+// 			if l.lastSequence >= e.Sequence {
+// 				outError <- fmt.Errorf("transaction numbers out of sequence")
+// 				return
+// 			}
+// 			l.lastSequence = e.Sequence
+// 			outEvent <- e
+// 		}
+// 		if err := scanner.Err(); err != nil {
+// 			outError <- fmt.Errorf("transaction log read failure: %w", err)
+// 			return
+// 		}
+// 	}()
+// 	return outEvent, outError
+// }
+
+func NewPostgresTransactionLogger(config PostgresDBParams) (TransactionLogger, error) {
+	connStr := fmt.Sprintf("host=%s dbname=%s user=%s password=%s", config.host, config.dbName, config.user, config.password)
+
+	db, err := sql.Open("postgres", connStr)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open transaction log file:%w", err)
+		return nil, fmt.Errorf("failed to open db: %w", err)
 	}
-	return &FileTransactionLogger{file: file}, nil
+	err = db.Ping()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open db connection: %w", err)
+	}
+	logger := &PostgresTransactionLogger{db: db}
+	exists, err := logger.verifyTableExists()
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify table exists: %w", err)
+	}
+	if !exists {
+		if err = logger.createTable(); err != nil {
+			return nil, fmt.Errorf("failed to create table: %w", err)
+		}
+	}
+
+	return logger, nil
 }
 
 func initalizeTransactionLog() error {
 	var err error
-	logger, err = NewFileTransactionLogger("transaction.log")
+	logger, err = NewPostgresTransactionLogger(PostgresDBParams{
+		host:     "localhost",
+		dbName:   "kvs",
+		user:     "",
+		password: "",
+	})
+
 	events, errors := logger.ReadEvents()
 	e, ok := Event{}, true
 	logger.Run()
@@ -217,7 +248,6 @@ func keyValueDeleteHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	initalizeTransactionLog()
 	r := mux.NewRouter()
 	r.HandleFunc("/v1/{key}", keyValuePutHandler).
 		Methods("PUT")

@@ -16,7 +16,7 @@ import (
 
 var logger TransactionLogger
 
-const transactionLogTableStr = "transactionLogs"
+const transactionLogTableStr = "transactionlogs"
 const dbName = "mydb"
 
 var store = struct {
@@ -73,7 +73,7 @@ func (l *PostgresTransactionLogger) WritePut(key, value string) {
 }
 func (l *PostgresTransactionLogger) WriteDelete(key string) {
 	select {
-	case l.events <- Event{EventType: EventDelete, Key: key, Value: "delete"}:
+	case l.events <- Event{EventType: EventDelete, Key: key}:
 	default:
 	}
 }
@@ -82,23 +82,55 @@ func (l *PostgresTransactionLogger) Err() <-chan error {
 }
 
 func (l *PostgresTransactionLogger) ReadEvents() (<-chan Event, <-chan error) {
-	events := make(<-chan Event)
-	errors := make(<-chan error)
-	// rows, err := l.db.Query(fmt.Sprintf(`SELECT * FROM %s ORDER BY logId;`, transactionLogTableStr))
-	//
-	return events, errors
+	outEvent := make(chan Event)
+	outError := make(chan error)
+	rows, err := l.db.Query(fmt.Sprintf(`SELECT type, key, value FROM %s ORDER BY logId;`, transactionLogTableStr))
+
+	go func() {
+		defer close(outEvent)
+		defer close(outError)
+		for rows.Next() {
+			var e Event
+			err = rows.Scan(&e.EventType, &e.Key, &e.Value)
+			fmt.Println(e)
+			if err != nil {
+				fmt.Println(err)
+				outError <- err
+			}
+			outEvent <- e
+		}
+	}()
+
+	return outEvent, outError
 }
 
 func (l *PostgresTransactionLogger) Run() {
+	events := make(chan Event, 16)
+	errors := make(chan error, 1)
 
-	return
+	l.events = events
+	l.errors = errors
+	go func() {
+		for e := range events {
+			ok, err := l.db.Exec(fmt.Sprintf(
+				`INSERT INTO %s(type, key, value) VALUES (%d,'%s','%s');`, transactionLogTableStr, e.EventType, e.Key, e.Value))
+			fmt.Println("run", ok, err)
+			if err != nil {
+				errors <- err
+				return
+			}
+		}
+	}()
 }
 
 func (l *PostgresTransactionLogger) verifyTableExists() (bool, error) {
 	query := fmt.Sprintf(`SELECT * FROM %s;`, transactionLogTableStr)
-	_, err := l.db.Query(query)
+	ok, err := l.db.Query(query)
+	fmt.Println("verifyTableExists", ok, err)
 	if errors.Is(err, errorTableDoesNotExist) {
-		return bool(false), err
+		return bool(false), nil
+	} else if err != nil {
+		return bool(false), nil
 	}
 	return bool(true), nil
 }
@@ -107,7 +139,7 @@ func (l *PostgresTransactionLogger) createTable() error {
 		`CREATE  TABLE IF NOT EXISTS %s (
 			logId 	SERIAL PRIMARY KEY,
 			type	INT NOT NULL,
-			key		TEXT NOT NULL,
+			key		VARCHAR(255) NOT NULL,
 			value	TEXT
 		);`, transactionLogTableStr)
 	_, err := l.db.Exec(createTableString)
@@ -135,7 +167,6 @@ func NewPostgresTransactionLogger(config PostgresDBParams) (TransactionLogger, e
 			return nil, fmt.Errorf("failed to create table: %w", err)
 		}
 	}
-
 	return logger, nil
 }
 
@@ -162,12 +193,11 @@ func initalizeTransactionLog(username, password string) error {
 			case EventDelete:
 				err = Delete(e.Key)
 			case EventPut:
-				fmt.Println("Reading in put")
 				err = Put(e.Key, e.Value)
 			}
 		}
 	}
-	fmt.Println("finished loading data", store.m)
+	fmt.Println("finished loading data from postgres: ", store.m)
 	return err
 }
 
@@ -240,12 +270,8 @@ func keyValueDeleteHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	dbUser := flag.String("username", "postgres", "username for db")
 	password := flag.String("password", "", "password for db")
-
 	flag.Parse()
-	fmt.Println(*dbUser, *password)
 	initalizeTransactionLog(*dbUser, *password)
-
-	return
 
 	r := mux.NewRouter()
 	r.HandleFunc("/v1/{key}", keyValuePutHandler).
